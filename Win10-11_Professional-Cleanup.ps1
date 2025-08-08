@@ -1,27 +1,45 @@
 <# 
 .SYNOPSIS
- Professionelles Windows 10/11 Cleanup – sicher, ohne Neustart, ohne Benutzerinteraktion.
- Mit fest integriertem DeepRepair (DISM + SFC) im Standardlauf.
+ Professionelles Windows 10/11 Cleanup-Skript für den Einsatz in produktiven Umgebungen.
 
-.DESCRIPTION
- Entfernt alle sicheren, unnötigen Dateien, Caches und Logs.
- Führt immer eine Integritätsprüfung und -reparatur durch (DISM/SFC).
- Nutzer können direkt weiterarbeiten. Funktioniert auf Win10/11.
+.BESCHREIBUNG
+ Dieses Skript bereinigt Windows 10/11 gründlich und sicher, ohne Neustart und ohne Benutzerinteraktion.
+ Es entfernt unnötige Dateien, Caches und Logs, und prüft/repariert Windows-Systemdateien.
+ Standardmäßig wird immer eine Integritätsprüfung (DeepRepair) durchgeführt.
 
-.PARAMETER IncludePrefetch
- Leert Prefetch-Ordner (SysMain wird kurz gestoppt/gestartet).
+.ANWENDUNG
+ 1. PowerShell als Administrator starten.
+ 2. In den Ordner wechseln, in dem das Skript liegt.
+ 3. Skript starten mit:
+    .\Win10-11_Admin-Cleanup.ps1
 
-.PARAMETER ResetWU
- Setzt Windows Update-Cache zurück (SoftwareDistribution & Catroot2 umbenennen).
+OPTIONALE PARAMETER:
+ -IncludePrefetch
+    Leert den Prefetch-Ordner (Programme starten beim ersten Mal etwas langsamer).
+ -BrowserCacheHard
+    Löscht Browser-Caches (Edge, Chrome, Firefox), ohne Cookies oder Passwörter.
+ -ResetWU
+    Setzt den Windows Update-Cache zurück (Updates werden ggf. neu geladen).
+ -DryRun
+    Simulation – es wird nichts gelöscht, nur angezeigt, was gelöscht würde.
+ -KeepLogsDays <Zahl>
+    Legt fest, wie viele Tage alte Log-Dateien im Ordner C:\ProgramData\SSIG\Cleanup behalten werden.
 
-.PARAMETER BrowserCacheHard
- Entfernt Browser-Caches (Edge, Chrome, Firefox) ohne Cookies/Passwörter.
+BEISPIELE:
+ • Standardlauf (empfohlen):
+   .\Win10-11_Admin-Cleanup.ps1
 
-.PARAMETER DryRun
- Nur simulieren – nichts wird gelöscht.
+ • Mit Prefetch- und Browser-Cache-Löschung:
+   .\Win10-11_Admin-Cleanup.ps1 -IncludePrefetch -BrowserCacheHard
 
-.PARAMETER KeepLogsDays
- Log-Aufbewahrung in Tagen (Default 14).
+ • Nur Simulation, keine Löschung:
+   .\Win10-11_Admin-Cleanup.ps1 -DryRun
+
+.HINWEISE
+ - Das Skript ist für Windows 10 und Windows 11 geeignet.
+ - Es werden keine persönlichen Dateien oder Programme entfernt.
+ - Nutzer können während der Ausführung weiterarbeiten.
+ - Dauer hängt von Systemzustand und PC-Leistung ab (DeepRepair kann mehrere Minuten beanspruchen).
 #>
 
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
@@ -181,3 +199,4 @@ Write-Log ("== Fertig | Gesamtdauer: {0:mm\:ss} | Vorher: {1:N0} MB frei | Nachh
 # Log-Hygiene
 Get-ChildItem $LogRoot -File | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$KeepLogsDays) } | Remove-Item -Force -ErrorAction SilentlyContinue
 Stop-Transcript | Out-Null
+
