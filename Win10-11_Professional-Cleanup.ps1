@@ -44,159 +44,284 @@ BEISPIELE:
 
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
 param(
-    [switch]$IncludePrefetch,
-    [switch]$ResetWU,
-    [switch]$BrowserCacheHard,
-    [switch]$DryRun,
-    [int]$KeepLogsDays = 14
+  [switch]$IncludePrefetch,
+  [switch]$BrowserCacheHard,
+  [switch]$CloseBrowsers,
+  [switch]$ResetWU,
+  [switch]$SkipCleanmgr,
+  [switch]$SkipDeepRepair,
+  [switch]$DryRun,
+  [int]$KeepLogsDays = 14
 )
 
-# --- Setup & Logging ---
-$ErrorActionPreference = 'SilentlyContinue'
-$PSDefaultParameterValues['*:ErrorAction'] = 'SilentlyContinue'
-$StartTime = Get-Date
-$LogRoot = "$env:ProgramData\SSIG\Cleanup"
-$null = New-Item -ItemType Directory -Force -Path $LogRoot
-$LogFile = Join-Path $LogRoot ("Cleanup_{0:yyyy-MM-dd_HH-mm-ss}.log" -f $StartTime)
-Start-Transcript -Path $LogFile -Force | Out-Null
+# -------------------- Basissetup --------------------
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Continue'  # Fehler gezielt abfangen
 
-function Write-Log {
-    param([string]$Message,[ValidateSet('INFO','WARN','ERROR')][string]$Level='INFO')
-    $line = "{0:u} [{1}] {2}" -f (Get-Date), $Level, $Message
-    Write-Host $line
-    Add-Content -Path $LogFile -Value $line
+# Admin-Check
+$principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  Write-Host "Dieses Skript muss als Administrator ausgeführt werden." -ForegroundColor Yellow
+  exit 1
 }
 
-function Get-FreeBytes($drive='C') {
-    try { (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${drive}:'").FreeSpace } catch { 0 }
+# Mutex gegen Doppelstart
+$mutexName = "Global\SSIG_CustomerSafe_Cleanup"
+$mutex = New-Object System.Threading.Mutex($false, $mutexName, [ref]$createdNew)
+if (-not $mutex.WaitOne(0)) {
+  Write-Host "Cleanup läuft bereits. Abbruch." -ForegroundColor Yellow
+  exit 2
+}
+
+# Logging
+$StartTime = Get-Date
+$LogRoot = "$env:ProgramData\SSIG\Cleanup"
+New-Item -ItemType Directory -Force -Path $LogRoot | Out-Null
+$LogFile = Join-Path $LogRoot ("Cleanup_{0:yyyy-MM-dd_HH-mm-ss}.log" -f $StartTime)
+try { Start-Transcript -Path $LogFile -Force | Out-Null } catch {}
+
+function Write-Log {
+  param([string]$Message,[ValidateSet('INFO','WARN','ERROR')][string]$Level='INFO')
+  $line = "{0:u} [{1}] {2}" -f (Get-Date), $Level, $Message
+  try { Write-Host $line } catch {}
+  try { Add-Content -Path $LogFile -Value $line -ErrorAction SilentlyContinue } catch {}
 }
 
 function Remove-PathSafe {
-    param([string]$Path)
-    if (Test-Path -LiteralPath $Path) {
-        if ($DryRun) { Write-Log "DRYRUN: würde löschen -> $Path" }
-        else {
-            try {
-                Get-ChildItem -LiteralPath $Path -Force -Recurse | ForEach-Object { try { $_.Attributes='Normal' } catch {} }
-                Remove-Item -LiteralPath $Path -Recurse -Force
-                Write-Log "Gelöscht: $Path"
-            } catch { Write-Log "Fehler beim Löschen: $Path => $($_.Exception.Message)" 'WARN' }
-        }
-    } else { Write-Log "Pfad nicht gefunden: $Path" 'INFO' }
+  param([string]$Path)
+  $hasWildcard = ($Path -like '*[*?]*')
+
+  if ($hasWildcard) {
+    $exists = Test-Path -Path $Path
+  } else {
+    $exists = Test-Path -LiteralPath $Path
+  }
+
+  if (-not $exists) {
+    Write-Log "Pfad nicht gefunden: $Path"
+    return
+  }
+
+  if ($DryRun) {
+    Write-Log "DRYRUN: würde löschen -> $Path"
+    return
+  }
+
+  try {
+    if ($hasWildcard) {
+      Get-ChildItem -Path $Path -Force -Recurse -ErrorAction SilentlyContinue |
+        ForEach-Object { try { $_.Attributes='Normal' } catch {} }
+      Remove-Item -Path $Path -Recurse -Force -ErrorAction SilentlyContinue
+    } else {
+      Get-ChildItem -LiteralPath $Path -Force -Recurse -ErrorAction SilentlyContinue |
+        ForEach-Object { try { $_.Attributes='Normal' } catch {} }
+      Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Log "Gelöscht: $Path"
+  } catch {
+    Write-Log "Fehler beim Löschen: $Path => $($_.Exception.Message)" 'WARN'
+  }
 }
 
-Write-Log "== Cleanup gestartet auf $env:COMPUTERNAME | User: $env:USERNAME | DryRun=$DryRun =="
+function Invoke-External {
+  param(
+    [Parameter(Mandatory)] [string]$FilePath,
+    [string[]]$Arguments = @()
+  )
+  if ($DryRun) { Write-Log "DRYRUN: würde starten -> $FilePath $($Arguments -join ' ')"; return 0 }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = $FilePath
+    $psi.Arguments = ($Arguments -join ' ')
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $out = $p.StandardOutput.ReadToEnd()
+    $err = $p.StandardError.ReadToEnd()
+    $p.WaitForExit()
+    if ($out) { Write-Log $out.Trim() }
+    if ($err) { Write-Log $err.Trim() 'WARN' }
+    return $p.ExitCode
+  } catch {
+    Write-Log "Startfehler: $FilePath => $($_.Exception.Message)" 'ERROR'
+    return -1
+  }
+}
+
+function Get-FreeBytes($drive='C') {
+  try { (Get-CimInstance Win32_LogicalDisk -Filter "DeviceID='${drive}:'").FreeSpace } catch { 0 }
+}
+
+# -------------------- Startinfo --------------------
+Write-Log "== Cleanup gestartet | Computer: $env:COMPUTERNAME | User: $env:USERNAME | DryRun=$DryRun =="
 $FreeBefore = Get-FreeBytes 'C'
 
-# --- 1) Benutzer-Temp ---
+# Benutzerordner ermitteln (nur echte Profile)
+$UserDirs = @(Get-ChildItem 'C:\Users' -Directory -Force -ErrorAction SilentlyContinue | Where-Object {
+  $_.Name -notin @('All Users','Default','Default User','Public','DefaultAppPool')
+})
+
+# -------------------- 1) Benutzer- und System-Temp --------------------
 Write-Log "[1] Benutzer-Temp & INetCache"
-Get-ChildItem 'C:\Users' -Directory -Force | ForEach-Object {
-    Remove-PathSafe "$($_.FullName)\AppData\Local\Temp\*"
-    Remove-PathSafe "$($_.FullName)\AppData\Local\Microsoft\Windows\INetCache\*"
+foreach ($U in $UserDirs) {
+  Remove-PathSafe "$($U.FullName)\AppData\Local\Temp\*"
+  Remove-PathSafe "$($U.FullName)\AppData\Local\Microsoft\Windows\INetCache\*"
 }
 
-# --- 2) System-Temp ---
 Write-Log "[2] System-Temp"
 Remove-PathSafe "$env:windir\Temp\*"
 Remove-PathSafe "$env:TEMP\*"
 
-# --- 3) Delivery Optimization Cache ---
+# -------------------- 2) Delivery Optimization Cache --------------------
 Write-Log "[3] Delivery Optimization Cache"
 Remove-PathSafe "C:\ProgramData\Microsoft\Windows\DeliveryOptimization\Cache\*"
 
-# --- 4) Windows-Logs & Setup-Logs ---
-Write-Log "[4] Windows-Logs"
+# -------------------- 3) Windows- und Setup-Logs --------------------
+Write-Log "[4] Windows-/Setup-Logs"
 Remove-PathSafe "$env:windir\Logs\CBS\*"
 Remove-PathSafe "$env:windir\Logs\DISM\*"
 Remove-PathSafe "$env:windir\Panther\*"
 Remove-PathSafe "$env:windir\inf\*.log"
 
-# --- 5) Shader-, Thumbnail- und Icon-Cache ---
-Write-Log "[5] Shader-, Thumbnail- und Icon-Cache"
-Remove-PathSafe "$env:localappdata\Microsoft\Windows\ShaderCache\*"
-Remove-PathSafe "$env:localappdata\Microsoft\Windows\Explorer\thumbcache_*.db"
-Remove-PathSafe "$env:localappdata\IconCache.db"
+# -------------------- 4) Caches (Shader/Thumbnail/Icon) profilübergreifend --------------------
+Write-Log "[5] Shader-, Thumbnail- und Icon-Cache (alle Profile)"
+foreach ($U in $UserDirs) {
+  $LocalApp = Join-Path $U.FullName "AppData\Local"
+  Remove-PathSafe "$LocalApp\Microsoft\Windows\ShaderCache\*"
+  Remove-PathSafe "$LocalApp\Microsoft\Windows\Explorer\thumbcache_*.db"
+  Remove-PathSafe "$LocalApp\IconCache.db"
+}
 
-# --- 6) Cleanmgr (silent) ---
-Write-Log "[6] Cleanmgr SAGERUN (silent)"
-$SageId = 20250
-$handlers = @(
+# -------------------- 5) Cleanmgr (Standard: an) --------------------
+if (-not $SkipCleanmgr) {
+  Write-Log "[6] Cleanmgr SAGERUN"
+  $SageId = 20250
+  $handlers = @(
     'Temporary Files','Temporary Setup Files','Old ChkDsk Files','Setup Log Files',
     'Windows Error Reporting Files','DirectX Shader Cache','Thumbnail Cache',
     'Update Cleanup','Device Driver Packages','Delivery Optimization Files'
-)
-$vcBase = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
-foreach ($h in $handlers) {
+  )
+  $vcBase = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
+  foreach ($h in $handlers) {
     $path = Join-Path $vcBase $h
     if (Test-Path $path -PathType Container -ErrorAction SilentlyContinue) {
-        if (-not $DryRun) { New-ItemProperty -Path $path -Name "StateFlags$SageId" -Value 2 -PropertyType DWord -Force | Out-Null }
+      if (-not $DryRun) {
+        try { New-ItemProperty -Path $path -Name "StateFlags$SageId" -Value 2 -PropertyType DWord -Force | Out-Null } catch {}
+      }
     }
+  }
+  if (-not $DryRun) { [void](Invoke-External -FilePath "cleanmgr.exe" -Arguments @("/sagerun:$SageId")) }
+} else {
+  Write-Log "[6] Cleanmgr deaktiviert (SkipCleanmgr)"
 }
-if (-not $DryRun) { & cleanmgr.exe /sagerun:$SageId }
 
-# --- 7) DISM StartComponentCleanup ---
-Write-Log "[7] DISM StartComponentCleanup"
-if (-not $DryRun) { & dism.exe /Online /Cleanup-Image /StartComponentCleanup /Quiet }
-
-# --- 8) Optional: Prefetch ---
+# -------------------- 6) Prefetch (optional) --------------------
 if ($IncludePrefetch) {
-    Write-Log "[8] Prefetch leeren"
-    if (-not $DryRun) {
-        try { Stop-Service SysMain -Force } catch {}
-        Remove-PathSafe "$env:windir\Prefetch\*"
-        try { Start-Service SysMain } catch {}
-    }
+  Write-Log "[7] Prefetch leeren"
+  if (-not $DryRun) {
+    try { Stop-Service SysMain -Force -ErrorAction SilentlyContinue } catch {}
+    Remove-PathSafe "$env:windir\Prefetch\*"
+    try { Start-Service SysMain -ErrorAction SilentlyContinue } catch {}
+  }
+} else {
+  Write-Log "[7] Prefetch übersprungen (Default: aus)"
 }
 
-# --- 9) Optional: Windows Update Reset ---
+# -------------------- 7) Windows Update Reset (optional) --------------------
 if ($ResetWU) {
-    Write-Log "[9] Windows Update-Cache zurücksetzen"
-    if (-not $DryRun) {
-        net stop wuauserv
-        net stop bits
-        net stop cryptsvc
-        Rename-Item "$env:windir\SoftwareDistribution" "SoftwareDistribution.old" -Force -ErrorAction SilentlyContinue
-        Rename-Item "$env:windir\System32\catroot2" "catroot2.old" -Force -ErrorAction SilentlyContinue
-        net start wuauserv
-        net start bits
-        net start cryptsvc
-    }
+  Write-Log "[8] Windows Update-Cache zurücksetzen"
+  if (-not $DryRun) {
+    Invoke-External -FilePath "net.exe" -Arguments @("stop","wuauserv") | Out-Null
+    Invoke-External -FilePath "net.exe" -Arguments @("stop","bits") | Out-Null
+    Invoke-External -FilePath "net.exe" -Arguments @("stop","cryptsvc") | Out-Null
+    try { Rename-Item "$env:windir\SoftwareDistribution" "SoftwareDistribution.old" -Force -ErrorAction SilentlyContinue } catch { Write-Log $_.Exception.Message 'WARN' }
+    try { Rename-Item "$env:windir\System32\catroot2" "catroot2.old" -Force -ErrorAction SilentlyContinue } catch { Write-Log $_.Exception.Message 'WARN' }
+    Invoke-External -FilePath "net.exe" -Arguments @("start","wuauserv") | Out-Null
+    Invoke-External -FilePath "net.exe" -Arguments @("start","bits") | Out-Null
+    Invoke-External -FilePath "net.exe" -Arguments @("start","cryptsvc") | Out-Null
+  }
+} else {
+  Write-Log "[8] Windows Update-Reset übersprungen (Default: aus)"
 }
 
-# --- 10) Optional: Browser-Caches ---
+# -------------------- 8) Browser-Caches (optional, profilübergreifend) --------------------
 if ($BrowserCacheHard) {
-    Write-Log "[10] Browser-Caches leeren"
+  Write-Log "[9] Browser-Caches leeren (Hard)"
+  if ($CloseBrowsers) {
+    try { Get-Process chrome, msedge, firefox -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 } catch {}
+  } else {
+    Write-Log "Browser werden nicht geschlossen (-CloseBrowsers nicht gesetzt). Gesperrte Dateien werden ggf. übersprungen." "WARN"
+  }
+  foreach ($U in $UserDirs) {
+    $LocalApp = Join-Path $U.FullName "AppData\Local"
+    $RoamApp  = Join-Path $U.FullName "AppData\Roaming"
     $paths = @(
-        "$env:localappdata\Microsoft\Edge\User Data\Default\Cache\*",
-        "$env:localappdata\Google\Chrome\User Data\Default\Cache\*",
-        "$env:appdata\Mozilla\Firefox\Profiles\*\cache2\*"
+      "$LocalApp\Microsoft\Edge\User Data\*\Cache\*",
+      "$LocalApp\Google\Chrome\User Data\*\Cache\*",
+      "$RoamApp\Mozilla\Firefox\Profiles\*\cache2\*"
     )
     foreach ($p in $paths) { Remove-PathSafe $p }
+  }
+} else {
+  Write-Log "[9] Browser-Hard-Clean übersprungen (Default: aus)"
 }
 
-# --- 11) DeepRepair (immer aktiv) ---
-$DeepRepairStart = Get-Date
-Write-Log "[11] DeepRepair gestartet"
+# -------------------- 9) DeepRepair (Standard: an, ohne Neustart) --------------------
+if (-not $SkipDeepRepair) {
+  Write-Log "[10] DeepRepair gestartet (DISM/SFC, kein automatischer Neustart)"
+  if (-not $DryRun) {
+    $code = Invoke-External -FilePath "dism.exe" -Arguments @("/Online","/Cleanup-Image","/ScanHealth")
+    if ($code -eq 0) {
+      [void](Invoke-External -FilePath "dism.exe" -Arguments @("/Online","/Cleanup-Image","/RestoreHealth","/NoRestart"))
+    } else {
+      Write-Log "DISM ScanHealth meldete Fehlercode $code – RestoreHealth wird übersprungen." "WARN"
+    }
+
+    # SFC: Neustart-Hinweise nur loggen, keinen Neustart auslösen
+    $sfcLogTmp = Join-Path $env:TEMP ("sfc_{0:yyyyMMdd_HHmmss}.log" -f (Get-Date))
+    try {
+      $psi = Start-Process -FilePath "sfc.exe" -ArgumentList "/scannow" -RedirectStandardOutput $sfcLogTmp -NoNewWindow -PassThru -ErrorAction SilentlyContinue
+      $psi.WaitForExit()
+      if (Test-Path $sfcLogTmp) {
+        $content = Get-Content $sfcLogTmp -ErrorAction SilentlyContinue
+        if ($content -match '(restart|Neustart|pending|ausstehend)') {
+          Write-Log "SFC meldet, dass ein Neustart für vollständige Reparaturen empfohlen/erforderlich ist. Kein Neustart wird ausgelöst." "WARN"
+        }
+        Remove-Item $sfcLogTmp -Force -ErrorAction SilentlyContinue
+      }
+    } catch {
+      Write-Log "SFC-Ausführung: $($_.Exception.Message)" "WARN"
+    }
+  }
+} else {
+  Write-Log "[10] DeepRepair übersprungen (SkipDeepRepair)"
+}
+
+# -------------------- 10) DNS-Cache --------------------
+Write-Log "[11] DNS-Cache leeren"
 if (-not $DryRun) {
-    & dism.exe /Online /Cleanup-Image /ScanHealth
-    & dism.exe /Online /Cleanup-Image /RestoreHealth
-    & sfc.exe /scannow
+  try { ipconfig /flushdns | Out-Null } catch { Write-Log "ipconfig/flushdns: $($_.Exception.Message)" "WARN" }
 }
-$DeepRepairDur = (Get-Date) - $DeepRepairStart
-Write-Log ("[11] DeepRepair beendet – Dauer: {0:mm\:ss}" -f $DeepRepairDur)
 
-# --- 12) DNS-Cache ---
-Write-Log "[12] DNS-Cache leeren"
-if (-not $DryRun) { ipconfig /flushdns | Out-Null }
-
-# --- Abschluss ---
+# -------------------- Abschluss --------------------
 $FreeAfter = Get-FreeBytes 'C'
 $freed = [math]::Max(0, ($FreeAfter - $FreeBefore))
 $freedMB = [math]::Round($freed/1MB,2)
 $dur = (Get-Date) - $StartTime
-Write-Log ("== Fertig | Gesamtdauer: {0:mm\:ss} | Vorher: {1:N0} MB frei | Nachher: {2:N0} MB frei | Gewinn: {3:N2} MB ==" -f $dur, ($FreeBefore/1MB), ($FreeAfter/1MB), $freedMB)
+Write-Log ("== Fertig | Dauer: {0:hh\:mm\:ss} | Frei vorher: {1:N0} MB | Frei nachher: {2:N0} MB | Gewinn: {3:N2} MB ==" -f $dur, ($FreeBefore/1MB), ($FreeAfter/1MB), $freedMB)
 
 # Log-Hygiene
-Get-ChildItem $LogRoot -File | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$KeepLogsDays) } | Remove-Item -Force -ErrorAction SilentlyContinue
-Stop-Transcript | Out-Null
+try {
+  Get-ChildItem $LogRoot -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$KeepLogsDays) } |
+    Remove-Item -Force -ErrorAction SilentlyContinue
+} catch {}
+
+# Cleanup Mutex & Transcript
+try { Stop-Transcript | Out-Null } catch {}
+try { $mutex.ReleaseMutex() | Out-Null } catch {}
 
