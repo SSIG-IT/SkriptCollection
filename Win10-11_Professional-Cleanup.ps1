@@ -1,22 +1,38 @@
 <#
 Windows 10/11 – Admin Cleanup Script
+------------------------------------
 Sicheres Bereinigungsskript für produktive Systeme ohne Neustart.
-Entfernt temporäre Dateien, Caches und Logs, prüft und repariert Windows-Komponenten (DISM/SFC).
+Entfernt temporäre Dateien, Caches und Logs,
+prüft und repariert Windows-Komponenten (DISM/SFC).
 Nutzer können währenddessen weiterarbeiten.
 
 Optionale Parameter:
- -IncludePrefetch     Prefetch-Ordner leeren
- -BrowserCacheHard    Browser-Caches (Edge, Chrome, Firefox) löschen
- -ResetWU             Windows Update-Cache zurücksetzen
- -DryRun              Simulation, keine Löschung
- -KeepLogsDays <Zahl> Aufbewahrungsdauer der Logs in Tagen
+  -IncludePrefetch
+      Prefetch-Ordner leeren (Programme starten beim ersten Mal etwas langsamer)
+  
+  -BrowserCacheHard
+      Browser-Caches löschen (Edge, Chrome, Firefox),
+      Cookies und Passwörter bleiben erhalten
+
+  -ResetWU
+      Windows Update-Cache zurücksetzen
+      (Updates werden ggf. neu geladen)
+
+  -DryRun
+      Nur Simulation – nichts wird gelöscht,
+      nur Vorgänge werden angezeigt
+
+  -KeepLogsDays <Zahl>
+      Anzahl Tage, die Logs in C:\ProgramData\SSIG\Cleanup aufbewahrt werden
 
 Beispiele:
- Standardlauf:
-   .\Win10-11_Admin-Cleanup.ps1
- Mit mehreren Optionen:
-   .\Win10-11_Admin-Cleanup.ps1 -IncludePrefetch -BrowserCacheHard -ResetWU
+  Standardlauf:
+    .\Win10-11_Admin-Cleanup.ps1
+
+  Mit mehreren Optionen:
+    .\Win10-11_Admin-Cleanup.ps1 -IncludePrefetch -BrowserCacheHard -ResetWU
 #>
+
 
 [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='Low')]
 param(
@@ -175,3 +191,4 @@ Write-Log ("== Fertig | Gesamtdauer: {0:mm\:ss} | Vorher: {1:N0} MB frei | Nachh
 # Log-Hygiene
 Get-ChildItem $LogRoot -File | Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-$KeepLogsDays) } | Remove-Item -Force -ErrorAction SilentlyContinue
 Stop-Transcript | Out-Null
+
